@@ -185,6 +185,55 @@ for f in img-a img-b; do
 done
 ok "重启后全部已归档文件仍可解密，且与原件逐字节一致"
 
+say "4/ 净化下载：内存重建 TIFF，剔除采集标签，标定标签与像素保留"
+# 用测试辅助构造一个含“敏感”采集标签的两页 TIFF（第二页无任何标定标签）
+PYTHONPATH="$PWD/tests:$PWD" "$PY" - "$BASE_DIR/samples/subject.tif" <<'EOF'
+import sys
+sys.path.insert(0, "tests")
+from tiff_builder import TiffBuilder, MAKE
+b = TiffBuilder()
+b.add_page(64, 64, calibration=((300, 1), (300, 1), 2),
+           extra_tags=[(MAKE, 2, "Subject-PII-001")])
+b.add_page(96, 80, calibration=None)
+open(sys.argv[1], "wb").write(b.build())
+EOF
+SID="$(upload "$BASE_DIR/samples/subject.tif")"
+SDID="$(curl -s -X POST "$BASE/api/files/$SID/sanitized-downloads" | jget download_id)"
+curl -s -D "$BASE_DIR/samples/sanitized.headers" -o "$BASE_DIR/samples/subject.sanitized.tif" \
+  "$BASE/api/sanitized-downloads/$SDID/content"
+grep -qi "x-sanitized-pages: 2" "$BASE_DIR/samples/sanitized.headers" \
+  && ok "净化成功，响应头注明 2 页；逐页注明见 X-Sanitized-Notes"
+if grep -a "Subject-PII-001" "$BASE_DIR/samples/subject.sanitized.tif" >/dev/null; then
+  echo "净化件中发现敏感采集标签！"; exit 1
+fi
+ok "净化件不含 Make 等采集标签/子目录，仅保留必要结构标签与有效标定标签"
+PYTHONPATH="$PWD/tests:$PWD" "$PY" - "$BASE_DIR/samples/subject.sanitized.tif" <<'EOF'
+import sys
+from tiff_builder import parse_tiff_tags
+pages = parse_tiff_tags(open(sys.argv[1], "rb").read())
+allowed = {256,257,258,259,262,273,277,278,279,284,282,283,296}
+assert all(set(p) <= allowed for p in pages), "出现白名单之外的标签"
+assert 282 in pages[0] and 296 in pages[0], "第 1 页标定标签丢失"
+assert {282,283,296}.isdisjoint(pages[1]), "第 2 页应无标定标签"
+print("   标签白名单与逐页标定状态断言通过")
+EOF
+
+# 失败路径：非默认方向的影像必须整件拒绝，且不产生半成品
+PYTHONPATH="$PWD/tests:$PWD" "$PY" - "$BASE_DIR/samples/oriented.tif" <<'EOF'
+import sys
+sys.path.insert(0, "tests")
+from tiff_builder import TiffBuilder
+b = TiffBuilder(); b.add_page(64, 64, orientation=6)
+open(sys.argv[1], "wb").write(b.build())
+EOF
+OID="$(upload "$BASE_DIR/samples/oriented.tif")"
+ODID="$(curl -s -X POST "$BASE/api/files/$OID/sanitized-downloads" | jget download_id)"
+CODE="$(curl -s -o "$BASE_DIR/samples/rejected.json" -w '%{http_code}' \
+  "$BASE/api/sanitized-downloads/$ODID/content")"
+[ "$CODE" = "422" ] && ok "非默认方向整件拒绝（HTTP 422）：$(cat "$BASE_DIR/samples/rejected.json")"
+[ ! -s "$BASE_DIR/samples/rejected.json" ] || grep -q "Orientation" "$BASE_DIR/samples/rejected.json" \
+  && ok "拒绝原因明确，且响应体只含错误 JSON、无任何 TIFF 字节"
+
 say "演示完成"
 echo "浏览器入口: $RESTART_BASE/ （本脚本结束后服务已停止；手动启动见 README）"
 echo "服务日志:   $LOG 、 $BASE_DIR/server-restart.log"

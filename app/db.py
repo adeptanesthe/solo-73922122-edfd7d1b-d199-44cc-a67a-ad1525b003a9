@@ -55,18 +55,27 @@ CREATE TABLE IF NOT EXISTS uploads (
 );
 
 -- 下载会话：accepted -> unwrapping -> completed
+-- kind=original 为原件下载；kind=sanitized 为净化下载（内存解密后重建 TIFF）。
 -- 受理时快照该文件当时的 KEK 标识与封装 DEK，保证轮换重封装后在途下载仍可读完；
 -- 到达终态后立即清空封装材料，避免已删除 KEK 留下可审计的旧钥引用。
+-- output_name：净化件输出文件名；error：净化失败原因（失败会话不产生任何可下载字节）；
+-- page_count / notes：净化结果逐页注明（如某页完全没有标定标签）。
 CREATE TABLE IF NOT EXISTS downloads (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     download_id  TEXT UNIQUE NOT NULL,
     file_id      INTEGER NOT NULL REFERENCES files(id),
+    kind         TEXT NOT NULL DEFAULT 'original' CHECK (kind IN ('original', 'sanitized')),
     kek_id       INTEGER NOT NULL REFERENCES project_keys(id),
     wrapped_dek  BLOB,
     dek_nonce    BLOB,
     nonce        BLOB,
     state        TEXT NOT NULL CHECK (state IN (
-                     'accepted', 'unwrapping', 'completed', 'interrupted', 'aborted')),
+                     'accepted', 'unwrapping', 'completed', 'interrupted',
+                     'aborted', 'failed')),
+    output_name  TEXT,
+    error        TEXT,
+    page_count   INTEGER,
+    notes        TEXT,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
@@ -98,4 +107,73 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    _migrate_downloads(conn)
     return conn
+
+
+def _migrate_downloads(conn: sqlite3.Connection) -> None:
+    """把旧版 downloads 表升级为支持净化下载的形态（幂等）。
+
+    旧库没有 kind/output_name/error/page_count/notes 列，且 state 的 CHECK
+    不包含 failed；SQLite 无法直接改 CHECK，需要在事务内重建表并迁回数据。
+    全新库由 SCHEMA 直接建成新形态，此处检测到列齐全即跳过。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads)").fetchall()}
+    required = {"kind", "output_name", "error", "page_count", "notes"}
+    if required <= cols:
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute("ALTER TABLE downloads RENAME TO downloads_legacy")
+        conn.execute(
+            """
+            CREATE TABLE downloads (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                download_id  TEXT UNIQUE NOT NULL,
+                file_id      INTEGER NOT NULL REFERENCES files(id),
+                kind         TEXT NOT NULL DEFAULT 'original' CHECK (kind IN ('original', 'sanitized')),
+                kek_id       INTEGER NOT NULL REFERENCES project_keys(id),
+                wrapped_dek  BLOB,
+                dek_nonce    BLOB,
+                nonce        BLOB,
+                state        TEXT NOT NULL CHECK (state IN (
+                                 'accepted', 'unwrapping', 'completed', 'interrupted',
+                                 'aborted', 'failed')),
+                output_name  TEXT,
+                error        TEXT,
+                page_count   INTEGER,
+                notes        TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            )
+            """
+        )
+        legacy_cols = {r[1] for r in conn.execute("PRAGMA table_info(downloads_legacy)").fetchall()}
+        select_cols = [
+            "id", "download_id", "file_id", "kek_id", "wrapped_dek", "dek_nonce",
+            "nonce", "state", "created_at", "updated_at",
+        ]
+        select_cols = [c for c in select_cols if c in legacy_cols]
+        # 旧行会话全部视为原件下载，新增列取默认值/NULL。
+        conn.execute(
+            f"""
+            INSERT INTO downloads (
+                {", ".join(select_cols[:3])}, kind,
+                {", ".join(select_cols[3:8])},
+                output_name, error, page_count, notes,
+                {", ".join(select_cols[8:])}
+            )
+            SELECT
+                {", ".join(select_cols[:3])}, 'original',
+                {", ".join(select_cols[3:8])},
+                NULL, NULL, NULL, NULL,
+                {", ".join(select_cols[8:])}
+            FROM downloads_legacy
+            """
+        )
+        conn.execute("DROP TABLE downloads_legacy")
+        conn.execute("COMMIT")
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")

@@ -139,11 +139,25 @@
   <!-- 文件列表 / 下载 -->
   <section class="panel full">
     <h2>④ 已归档影像与下载 <span class="hint">受理即快照 KEK/封装DEK，轮换重封装后在途下载仍可读完</span></h2>
-    <table><thead><tr><th>file_id</th><th>文件名</th><th>大小</th><th>封装密钥</th><th>SHA-256</th><th>归档时间</th><th></th></tr></thead>
+    <table><thead><tr><th>file_id</th><th>文件名</th><th>大小</th><th>封装密钥</th><th>SHA-256</th><th>归档时间</th><th>下载操作</th></tr></thead>
       <tbody id="files-body"></tbody></table>
-    <h2 style="margin-top:16px">下载会话</h2>
-    <table><thead><tr><th>download_id</th><th>文件</th><th>使用 KEK</th><th>状态</th><th>时间</th><th></th></tr></thead>
+    <h2 style="margin-top:16px">下载会话（原件 / 净化）</h2>
+    <table><thead><tr><th>download_id</th><th>类型</th><th>文件</th><th>使用 KEK</th><th>状态</th><th>注明 / 失败原因</th><th>时间</th><th></th></tr></thead>
       <tbody id="downloads-body"></tbody></table>
+  </section>
+
+  <!-- 净化下载说明 -->
+  <section class="panel full">
+    <h2>⑤ 净化下载（交给合作组）<span class="hint">内存解密并重建 TIFF，原归档不变，明文与数据密钥不落盘</span></h2>
+    <div class="small" style="line-height:1.8">
+      对选中影像在<b>内存中</b>解密并重建 TIFF：逐页保留解码后的灰度像素、页序及完整有效的
+      <span class="mono">XResolution / YResolution / ResolutionUnit</span>；输出仅含必要结构标签与这些标定标签，
+      不带出其他源标签或子目录（SubIFD）。<br/>
+      支持 1～3 页、每页宽高 64～512 像素的 8 位灰度未压缩 TIFF；<b>某页损坏、方向非默认（Orientation≠1）
+      或标定标签残缺/无效时整件拒绝，不产生可下载的半成品</b>；完全没有标定标签的页可处理并在会话与响应头中注明。<br/>
+      净化下载与原件下载共用「下载待解封」暂停点：已受理的净化读取在课题密钥轮换期间仍会读完该件原件，
+      轮换收尾会等待其结束后才删除旧 KEK。
+    </div>
   </section>
 </main>
 
@@ -204,6 +218,26 @@ async function startDownload(fileId, name) {
 async function abortDownload(id) { await api('POST', `/api/downloads/${id}/abort`); log('已中止下载会话 ' + id.slice(0,8), ''); refresh(); }
 async function abortUpload(id) { await api('POST', `/api/uploads/${id}/abort`); log('已中止上传会话 ' + id.slice(0,8), ''); refresh(); }
 
+// ---------- 净化下载（内存解密重建，整件失败不出半成品） ----------
+async function startSanitizedDownload(fileId, name) {
+  try {
+    const d = await api('POST', `/api/files/${fileId}/sanitized-downloads`);
+    log(`净化下载受理 ${d.download_id.slice(0,8)}…（快照 KEK 与封装 DEK，输出名 ${d.output_name}）`, 'info');
+    const r = await fetch(`/api/sanitized-downloads/${d.download_id}/content`);
+    if (!r.ok) {
+      const j = await r.json().catch(()=>null);
+      throw new Error(j?.error || r.statusText);
+    }
+    const blob = await r.blob();
+    const pages = r.headers.get('X-Sanitized-Pages') || '?';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = d.output_name; a.click();
+    URL.revokeObjectURL(url);
+    log(`净化完成：${pages} 页，仅含必要结构标签与有效标定标签，浏览器下载 ${d.output_name}（${fmtSize(blob.size)}）`, 'ok');
+    await refresh();
+  } catch (e) { log('净化下载失败（未产生任何半成品）：' + e.message, 'err'); await refresh(); }
+}
+
 // ---------- 轮换 ----------
 $('btn-rotate').onclick = async () => {
   try { await api('POST', '/api/rotations'); log('已发起课题密钥轮换', 'info'); await refresh(); }
@@ -253,7 +287,10 @@ async function refresh() {
       `<tr><td class="mono">${short(f.file_id)}</td><td class="truncate" title="${esc(f.filename)}">${esc(f.filename)}</td>
        <td>${fmtSize(f.size)}</td><td class="mono">#${f.kek_id} ${short(f.kek_key_id,8)}</td>
        <td class="mono small">${short(f.sha256,18)}</td><td class="small">${esc(f.created_at)}</td>
-       <td><button onclick="startDownload('${f.file_id}','${esc(f.filename)}')">下载</button></td></tr>`
+       <td class="row">
+         <button onclick="startDownload('${f.file_id}','${esc(f.filename)}')">原件下载</button>
+         <button class="secondary" onclick="startSanitizedDownload('${f.file_id}','${esc(f.filename)}')">净化下载</button>
+       </td></tr>`
     ).join('') || '<tr><td colspan="7" class="small">暂无归档影像</td></tr>';
 
     $('uploads-body').innerHTML = uploads.map(u =>
@@ -263,11 +300,19 @@ async function refresh() {
        <td>${['created','pending_register'].includes(u.state) ? `<button class="secondary" onclick="abortUpload('${u.upload_id}')">中止</button>` : ''}</td></tr>`
     ).join('') || '<tr><td colspan="7" class="small">暂无上传会话</td></tr>';
 
-    $('downloads-body').innerHTML = downloads.map(d =>
-      `<tr><td class="mono">${short(d.download_id)}</td><td class="truncate">${esc(d.filename)}</td>
-       <td class="mono">#${d.kek_id}</td><td>${badge(d.state)}</td><td class="small">${esc(d.updated_at)}</td>
-       <td>${['accepted','unwrapping'].includes(d.state) ? `<button class="secondary" onclick="abortDownload('${d.download_id}')">中止</button>` : ''}</td></tr>`
-    ).join('') || '<tr><td colspan="6" class="small">暂无下载会话</td></tr>';
+    $('downloads-body').innerHTML = downloads.map(d => {
+      const note = d.state === 'failed'
+        ? `<div class="small" style="color:var(--red)">${esc(d.error || '')}</div>`
+        : (Array.isArray(d.notes) ? d.notes.map(n => `<div class="small">${esc(n)}</div>`).join('') : '');
+      const kindLabel = d.kind === 'sanitized'
+        ? '<span class="badge b-running">净化</span>'
+        : '<span class="badge b-created">原件</span>';
+      return `<tr><td class="mono">${short(d.download_id)}</td><td>${kindLabel}</td>
+       <td class="truncate" title="${esc(d.filename)}">${esc(d.filename)}${d.output_name ? '<div class="small">→ '+esc(d.output_name)+'</div>' : ''}</td>
+       <td class="mono">#${d.kek_id}</td><td>${badge(d.state)}</td><td>${note}</td>
+       <td class="small">${esc(d.updated_at)}</td>
+       <td>${['accepted','unwrapping'].includes(d.state) ? `<button class="secondary" onclick="abortDownload('${d.download_id}')">中止</button>` : ''}</td></tr>`;
+    }).join('') || '<tr><td colspan="8" class="small">暂无下载会话</td></tr>';
 
     const gu = status.gates.upload_register, gd = status.gates.download_unwrap;
     $('g-up-state').textContent = (gu.paused ? '已暂停 · 等待 ' : '放行中 · 等待 ') + gu.waiting;

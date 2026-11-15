@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -120,6 +122,29 @@ def abort_download(download_id: str) -> dict[str, Any]:
 @app.get("/api/downloads")
 def list_downloads() -> list[dict[str, Any]]:
     return svc().list_downloads()
+
+
+# --------------------------- 净化下载（内存解密重建，不带出敏感标签） --------------------------- #
+@app.post("/api/files/{file_id}/sanitized-downloads", status_code=201)
+def accept_sanitized_download(file_id: str) -> dict[str, Any]:
+    return svc().accept_sanitized_download(file_id)
+
+
+@app.get("/api/sanitized-downloads/{download_id}/content")
+def open_sanitized_download(download_id: str) -> Response:
+    result = svc().open_sanitized_download(download_id)
+    # 中文文件名走 RFC 5987 编码；逐页注明随响应头返回（ASCII 转义，头部安全）。
+    disposition = (
+        f"attachment; filename=\"{result['filename'].encode('ascii', 'replace').decode()}\"; "
+        f"filename*=UTF-8''{quote(result['filename'])}"
+    )
+    headers = {
+        "Content-Disposition": disposition,
+        "X-SHA256": result["sha256"],
+        "X-Sanitized-Pages": str(result["page_count"]),
+        "X-Sanitized-Notes": quote(json.dumps(result["notes"], ensure_ascii=True)),
+    }
+    return Response(content=result["content"], media_type="image/tiff", headers=headers)
 
 
 # --------------------------- 文件与课题密钥 --------------------------- #

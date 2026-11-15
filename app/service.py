@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -16,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import crypto
+from . import crypto, tiff
 from .db import connect
 
 MAX_FILE_SIZE = 8 * 1024 * 1024  # 每件不超过 8 MiB
@@ -447,27 +448,40 @@ class Service:
         }
 
     # ------------------------------------------------------------------ #
-    # 下载：accepted -> 暂停点（待解封）-> unwrapping -> completed
+    # 下载：accepted -> 暂停点（待解封）-> unwrapping -> completed/failed
+    # kind='original' 原件下载；kind='sanitized' 净化下载（内存重建 TIFF）
     # ------------------------------------------------------------------ #
     def accept_download(self, file_id: str) -> dict[str, Any]:
+        return self._accept_download(file_id, "original")
+
+    def accept_sanitized_download(self, file_id: str) -> dict[str, Any]:
+        return self._accept_download(file_id, "sanitized")
+
+    def _accept_download(self, file_id: str, kind: str) -> dict[str, Any]:
         with self.lock:
             f = self._row("SELECT * FROM files WHERE file_id=?", (file_id,))
             if f is None:
                 raise ServiceError("文件不存在", 404)
             download_id = uuid.uuid4().hex
             now = self._now()
+            output_name = (
+                tiff.sanitized_output_name(f["filename"]) if kind == "sanitized" else None
+            )
             # 受理即快照：即使随后轮换重封装了 files 行，在途下载仍持有
             # 旧封装副本与旧 KEK 标识，必须能把原件读完。
             self.conn.execute(
-                "INSERT INTO downloads (download_id, file_id, kek_id, wrapped_dek, dek_nonce, "
-                "nonce, state, created_at, updated_at) VALUES (?,?,?,?,?,?, 'accepted', ?, ?)",
+                "INSERT INTO downloads (download_id, file_id, kind, kek_id, wrapped_dek, "
+                "dek_nonce, nonce, state, output_name, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?, 'accepted', ?, ?, ?)",
                 (
                     download_id,
                     f["id"],
+                    kind,
                     f["current_kek_id"],
                     f["wrapped_dek"],
                     f["dek_nonce"],
                     f["nonce"],
+                    output_name,
                     now,
                     now,
                 ),
@@ -476,77 +490,136 @@ class Service:
             return {
                 "download_id": download_id,
                 "file_id": file_id,
+                "kind": kind,
                 "filename": f["filename"],
+                "output_name": output_name,
                 "state": "accepted",
             }
 
-    def open_download(self, download_id: str) -> dict[str, Any]:
-        """解封并读完原件密文，返回明文字节（仅存在于内存，随响应返回不落盘）。"""
-        with self.lock:
-            dl = self._row("SELECT * FROM downloads WHERE download_id=?", (download_id,))
-            if dl is None:
-                raise ServiceError("下载会话不存在", 404)
-            if dl["state"] == "completed":
-                raise ServiceError("下载会话已完成，请重新发起下载", 410)
-            if dl["state"] in ("interrupted", "aborted"):
-                raise ServiceError(f"下载会话状态为 {dl['state']}，请重新发起", 409)
+    def _unwrap_original_locked(self, dl: sqlite3.Row) -> dict[str, Any]:
+        """解封原件并读完密文，返回明文字节（仅存在于内存，随响应返回不落盘）。"""
+        f = self._row("SELECT * FROM files WHERE id=?", (dl["file_id"],))
+        if f is None:
+            raise ServiceError("归档文件已不存在", 404)
 
-            # 暂停点：下载待解封。等待期间释放锁，避免与闸门控制死锁。
-            if self.download_gate.paused:
-                with self._unlocked_wait(self.download_gate):
-                    pass
-            dl = self._row("SELECT * FROM downloads WHERE id=?", (dl["id"],))
-            if dl is None or dl["state"] not in ("accepted", "unwrapping"):
-                raise ServiceError("下载会话在暂停期间状态发生变化", 409)
-
-            f = self._row("SELECT * FROM files WHERE id=?", (dl["file_id"],))
-            if f is None:
-                raise ServiceError("归档文件已不存在", 404)
-
-            self.conn.execute(
-                "UPDATE downloads SET state='unwrapping', updated_at=? WHERE id=?",
-                (self._now(), dl["id"]),
+        kek_row = self._row("SELECT * FROM project_keys WHERE id=?", (dl["kek_id"],))
+        if kek_row is None:
+            raise ServiceError("课题密钥记录缺失，无法解封", 500)
+        if not os.path.exists(self._kek_path(kek_row["key_id"])):
+            raise ServiceError(
+                "课题密钥文件已被删除，在途下载无法解封（收尾逻辑不应允许此情况）", 500
             )
-            self.conn.commit()
+        kek = self._get_kek(kek_row["id"])
+        dek = crypto.unwrap_dek(kek, dl["dek_nonce"], dl["wrapped_dek"])
 
-            # 用受理时快照的 KEK / 封装 DEK 解封——不依赖 files 行当前值。
-            kek_row = self._row("SELECT * FROM project_keys WHERE id=?", (dl["kek_id"],))
-            if kek_row is None:
-                raise ServiceError("课题密钥记录缺失，无法解封", 500)
-            if not os.path.exists(self._kek_path(kek_row["key_id"])):
-                raise ServiceError(
-                    "课题密钥文件已被删除，在途下载无法解封（收尾逻辑不应允许此情况）", 500
+        with open(f["blob_path"], "rb") as bf:
+            blob = bf.read()
+        nonce, ciphertext = blob[: crypto.NONCE_SIZE], blob[crypto.NONCE_SIZE:]
+        plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
+
+        if hashlib.sha256(plaintext).hexdigest() != f["sha256"]:
+            raise ServiceError("解密后摘要校验失败，原件可能已损坏", 500)
+        return {"filename": f["filename"], "content": plaintext, "sha256": f["sha256"]}
+
+    def open_download(self, download_id: str) -> dict[str, Any]:
+        """原件下载：解封并读完原件密文，返回明文字节（不落盘）。"""
+        with self.lock:
+            dl = self._wait_and_unwrap(download_id)
+            result = self._unwrap_original_locked(dl)
+            self._finish_download_locked(dl)
+            return result
+
+    def open_sanitized_download(self, download_id: str) -> dict[str, Any]:
+        """净化下载：内存解封原件 -> 解析/校验 -> 重建净化 TIFF。
+
+        任一页损坏、方向非默认或标定标签残缺/无效时，整件标记 failed 并返回
+        422 与具体原因，不产生任何可下载的半成品；明文与 DEK 始终只在内存。
+        """
+        with self.lock:
+            dl = self._wait_and_unwrap(download_id)
+            if dl["kind"] != "sanitized":
+                raise ServiceError("该下载会话不是净化下载", 409)
+            try:
+                result = self._unwrap_original_locked(dl)
+            except ServiceError:
+                self._fail_download_locked(
+                    dl, "原件解封失败，无法净化（详见服务端日志/会话记录）"
                 )
-            kek = self._get_kek(kek_row["id"])
-            dek = crypto.unwrap_dek(kek, dl["dek_nonce"], dl["wrapped_dek"])
+                raise
+            try:
+                sanitized = tiff.build_sanitized_tiff(result["content"])
+            except tiff.TiffError as exc:
+                # 整件拒绝：记录原因，清空快照封装材料，不返回任何字节。
+                self._fail_download_locked(dl, str(exc))
+                raise ServiceError(f"净化被拒绝：{exc}", 422) from None
 
-            with open(f["blob_path"], "rb") as bf:
-                blob = bf.read()
-            nonce, ciphertext = blob[: crypto.NONCE_SIZE], blob[crypto.NONCE_SIZE:]
-            plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
-
-            if hashlib.sha256(plaintext).hexdigest() != f["sha256"]:
-                raise ServiceError("解密后摘要校验失败，原件可能已损坏", 500)
-
-            # 读完原件后清除受理快照中的封装材料：终态下载不再持有任何 KEK 引用。
+            notes_json = json.dumps(sanitized.notes, ensure_ascii=False)
             self.conn.execute(
                 "UPDATE downloads SET state='completed', wrapped_dek=NULL, dek_nonce=NULL, "
-                "nonce=NULL, updated_at=? WHERE id=?",
-                (self._now(), dl["id"]),
+                "nonce=NULL, page_count=?, notes=?, updated_at=? WHERE id=?",
+                (sanitized.page_count, notes_json, self._now(), dl["id"]),
             )
             self.conn.commit()
             return {
-                "filename": f["filename"],
-                "content": plaintext,
-                "sha256": f["sha256"],
+                "filename": dl["output_name"],
+                "content": sanitized.content,
+                "sha256": hashlib.sha256(sanitized.content).hexdigest(),
+                "page_count": sanitized.page_count,
+                "notes": sanitized.notes,
+                "source_filename": result["filename"],
             }
+
+    def _wait_and_unwrap(self, download_id: str) -> sqlite3.Row:
+        """共用前置：校验会话状态、在“待解封”暂停点等待、置 unwrapping。"""
+        dl = self._row("SELECT * FROM downloads WHERE download_id=?", (download_id,))
+        if dl is None:
+            raise ServiceError("下载会话不存在", 404)
+        if dl["state"] == "completed":
+            raise ServiceError("下载会话已完成，请重新发起下载", 410)
+        if dl["state"] == "failed":
+            raise ServiceError(f"净化下载已失败：{dl['error'] or '原因未记录'}，请重新发起", 410)
+        if dl["state"] in ("interrupted", "aborted"):
+            raise ServiceError(f"下载会话状态为 {dl['state']}，请重新发起", 409)
+
+        # 暂停点：下载待解封。等待期间释放锁，避免与闸门控制死锁。
+        if self.download_gate.paused:
+            with self._unlocked_wait(self.download_gate):
+                pass
+        dl = self._row("SELECT * FROM downloads WHERE id=?", (dl["id"],))
+        if dl is None or dl["state"] not in ("accepted", "unwrapping"):
+            raise ServiceError("下载会话在暂停期间状态发生变化", 409)
+
+        self.conn.execute(
+            "UPDATE downloads SET state='unwrapping', updated_at=? WHERE id=?",
+            (self._now(), dl["id"]),
+        )
+        self.conn.commit()
+        return dl
+
+    def _finish_download_locked(self, dl: sqlite3.Row) -> None:
+        """读完原件后清除受理快照中的封装材料：终态下载不再持有任何 KEK 引用。"""
+        self.conn.execute(
+            "UPDATE downloads SET state='completed', wrapped_dek=NULL, dek_nonce=NULL, "
+            "nonce=NULL, updated_at=? WHERE id=?",
+            (self._now(), dl["id"]),
+        )
+        self.conn.commit()
+
+    def _fail_download_locked(self, dl: sqlite3.Row, reason: str) -> None:
+        """净化失败终态：同样清空封装材料，不残留旧钥引用，且无任何输出字节。"""
+        self.conn.execute(
+            "UPDATE downloads SET state='failed', wrapped_dek=NULL, dek_nonce=NULL, "
+            "nonce=NULL, error=?, updated_at=? WHERE id=?",
+            (reason, self._now(), dl["id"]),
+        )
+        self.conn.commit()
 
     def abort_download(self, download_id: str) -> dict[str, Any]:
         with self.lock:
             dl = self._row("SELECT * FROM downloads WHERE download_id=?", (download_id,))
             if dl is None:
                 raise ServiceError("下载会话不存在", 404)
-            if dl["state"] in ("completed", "aborted", "interrupted"):
+            if dl["state"] in ("completed", "aborted", "interrupted", "failed"):
                 return {"download_id": download_id, "state": dl["state"]}
             self.conn.execute(
                 "UPDATE downloads SET state='aborted', wrapped_dek=NULL, dek_nonce=NULL, "
@@ -799,11 +872,21 @@ class Service:
     def list_downloads(self) -> list[dict[str, Any]]:
         with self.lock:
             rows = self._all(
-                "SELECT d.download_id, d.state, d.kek_id, d.created_at, d.updated_at, "
+                "SELECT d.download_id, d.state, d.kind, d.kek_id, d.created_at, d.updated_at, "
+                "d.output_name, d.error, d.page_count, d.notes, "
                 "f.file_id AS file_id, f.filename AS filename FROM downloads d "
                 "JOIN files f ON f.id=d.file_id ORDER BY d.id DESC"
             )
-            return [dict(r) for r in rows]
+            payload: list[dict[str, Any]] = []
+            for r in rows:
+                item = dict(r)
+                if r["notes"]:
+                    try:
+                        item["notes"] = json.loads(r["notes"])
+                    except (ValueError, TypeError):
+                        item["notes"] = [r["notes"]]
+                payload.append(item)
+            return payload
 
     def set_gate(self, name: str, paused: bool) -> dict[str, Any]:
         gate = {

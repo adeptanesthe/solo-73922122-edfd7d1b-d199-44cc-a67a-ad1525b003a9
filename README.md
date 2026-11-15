@@ -2,8 +2,9 @@
 
 FastAPI + SQLite + `cryptography` 实现的单课题 TIFF 加密归档网页：每件影像以独立随机
 数据密钥（DEK）做 AES-256-GCM 加密，DEK 再由课题密钥（KEK，AES-256-GCM）封装后入库；
-密文与课题密钥**分目录持久保存**，原件明文与数据密钥**绝不落盘**。支持上传、下载、
-课题密钥轮换及进度查看，轮换期间上传下载照常，重启自动续办。
+密文与课题密钥**分目录持久保存**，原件明文与数据密钥**绝不落盘**。支持上传、原件下载、
+**净化下载（内存解密并重建 TIFF，剔除采集描述等受试者信息）**、课题密钥轮换及进度查看，
+轮换期间上传下载照常，重启自动续办。
 
 ## 一、快速开始
 
@@ -50,10 +51,43 @@ ARCHIVE_DATA_DIR=./data uvicorn app.main:app --host 127.0.0.1 --port 8000
    （重封装件数、阻塞中的上传/下载数、旧钥文件是否已删除）；
 2. **演示控制（暂停点）**：可分别暂停/恢复“上传待登记”和“下载待解封”两个闸门；
 3. **上传**：选择 `.tif/.tiff`（每件 ≤ 8 MiB），页面展示三阶段状态机；
-4. **已归档影像与下载**：查看每件影像当前封装在哪个 KEK 下，发起两阶段下载；
-5. **操作日志**：所有关键动作带时间戳输出。
+4. **已归档影像与下载**：查看每件影像当前封装在哪个 KEK 下，可发起**原件下载**或
+   **净化下载**，并查看两类下载会话的状态、逐页注明与失败原因；
+5. **净化下载说明与操作日志**：净化规则与边界见下节，所有关键动作带时间戳输出。
 
-## 三、本地演示脚本
+## 三、净化下载（交给合作组，不带走受试者信息）
+
+在影像行点击「净化下载」，服务端在**内存中**解封原件并重建一份全新 TIFF，原归档密文与
+封装关系不变，明文与 DEK 全程不落盘（与原件下载共用「下载待解封」暂停点和受理快照机制）。
+
+### 保留与剔除
+
+- **逐页保留**：解码后的 8 位灰度像素（逐字节）、页序，以及完整有效的
+  `XResolution`、`YResolution`、`ResolutionUnit` 三枚标定标签（含 RATIONAL 分数值）。
+- **输出只含**必要结构标签（ImageWidth/ImageLength/BitsPerSample/Compression/
+  PhotometricInterpretation/StripOffsets/SamplesPerPixel/RowsPerStrip/
+  StripByteCounts/PlanarConfiguration）与上述标定标签；统一重排为小端、每页单条带的
+  未压缩 TIFF。
+- **不带出**任何其他源标签（如 Make/Software 等采集描述）或子目录（SubIFD）。
+
+### 适用范围与整件拒绝规则
+
+- 支持 1～3 页、每页宽高 64～512 像素的 8 位灰度（单样本、未压缩）Classic TIFF（II/MM 均可）。
+- **某页损坏（IFD/条带越界、字节数不符等）、方向非默认（Orientation 存在且 ≠1）、
+  或标定标签残缺/无效时，整件拒绝**：下载会话标记 `failed` 并记录中文原因，HTTP 返回
+  422，**不产生任何可下载的半成品**；失败会话同样清空受理快照中的封装材料。
+- 标定标签三枚必须同时存在且有效（RATIONAL 分子分母为正、ResolutionUnit ∈ {1,2,3}）；
+  **三枚完全缺失的页可正常处理**，并在会话记录与响应头 `X-Sanitized-Notes` 中注明
+  「本页无任何标定标签」。
+- 输出文件名固定为 `<原文件名去扩展>.sanitized.tif`，响应头另带 `X-Sanitized-Pages`
+  与 `X-Sanitized-Notes`（逐页注明，URL 编码的 JSON）。
+
+### 与密钥轮换的关系
+
+净化下载与原件下载一样在受理时快照 KEK 标识与封装 DEK：已受理的净化读取遇到课题密钥
+轮换，仍能用旧快照读完该件原件并完成重建；轮换收尾会等待该在途会话结束后才删除旧 KEK。
+
+## 四、本地演示脚本
 
 脚本自动启动服务并完整演示题目要求的三类场景：
 
@@ -79,18 +113,23 @@ PORT=8092 PORT2=8093 RESTART=report ./scripts/demo.sh /tmp/demo
 
 恢复逻辑与进程重启完全相同（都是重新执行 `Service._recover()`），仅进程替换方式不同。
 
-## 四、测试
+## 五、测试
 
 ```bash
 pip install -r requirements-dev.txt
 pytest -q
 ```
 
-9 个端到端测试（FastAPI TestClient + 真实 SQLite/文件系统），覆盖：明文不落盘不变量、
-8 MiB 上限、轮换只重封装 DEK 且密文逐字节不变、旧 KEK 文件删除后才报完成、两个暂停点、
-在途下载读完原件、同期只允许一次轮换、轮换中重启续办、重启清理暂存。
+共 24 个端到端测试（FastAPI TestClient + 真实 SQLite/文件系统）。原 9 个归档/轮换测试覆盖：
+明文不落盘不变量、8 MiB 上限、轮换只重封装 DEK 且密文逐字节不变、旧 KEK 文件删除后才报完成、
+两个暂停点、在途下载读完原件、同期只允许一次轮换、轮换中重启续办、重启清理暂存。
+新增 15 个净化测试（`tests/test_sanitize.py`，配合手工 TIFF 构造器 `tests/tiff_builder.py`）
+覆盖：逐页像素/页序/标定保留、敏感标签与 SubIFD 不带出、II/MM 字节序、无标定页注明、
+标定残缺/无效拒绝、非默认方向拒绝、损坏页/截断/魔数错误拒绝且无半成品、1～3 页与 64～512
+尺寸边界、非灰度/压缩/位深拒绝、明文与 DEK 不落盘且原归档不变、在途净化读取穿越密钥轮换、
+失败不影响后续下载、重启后受理会话中断且可重新发起；另含旧版 downloads 表的 schema 迁移验证。
 
-## 五、HTTP API 摘要
+## 六、HTTP API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -98,15 +137,17 @@ pytest -q
 | PUT | `/api/uploads/{id}/content` | 上传密文前置：服务端用内存随机 DEK 加密并暂存 |
 | POST | `/api/uploads/{id}/complete` | **待登记暂停点** → 用当前 KEK 封装 DEK 并登记归档 |
 | POST | `/api/uploads/{id}/abort` | 中止上传并清理暂存 |
-| POST | `/api/files/{file_id}/downloads` | 受理下载，快照 KEK 标识与封装 DEK |
+| POST | `/api/files/{file_id}/downloads` | 受理原件下载，快照 KEK 标识与封装 DEK |
 | GET | `/api/downloads/{id}/content` | **待解封暂停点** → 解封并读完原件，返回明文 |
-| POST | `/api/downloads/{id}/abort` | 中止下载 |
+| POST | `/api/downloads/{id}/abort` | 中止下载会话 |
+| POST | `/api/files/{file_id}/sanitized-downloads` | 受理净化下载，同样快照 KEK/封装 DEK，预定输出名 |
+| GET | `/api/sanitized-downloads/{id}/content` | 内存解封→解析校验→重建净化 TIFF；失败返回 422 且无字节 |
 | POST | `/api/rotations` | 发起轮换（已有轮换时 409） |
 | GET | `/api/rotations/current` | 轮换状态与进度（页面 1.5s 轮询） |
-| GET | `/api/files` `/api/keys` `/api/uploads` `/api/downloads` | 列表查询 |
+| GET | `/api/files` `/api/keys` `/api/uploads` `/api/downloads` | 列表查询（downloads 含 kind/output_name/error/page_count/notes） |
 | POST | `/api/demo/gates/{upload_register,download_unwrap}` | 演示暂停门 `{"paused": true/false}` |
 
-## 六、设计要点与安全不变量
+## 七、设计要点与安全不变量
 
 1. **两级密钥**：每件影像独立随机 DEK（32 B，仅存在于进程内存）；KEK（32 B）保存在
    `keys/*.kek`（带魔数头、权限 600、原子写 + fsync）。封装与原件加密使用不同的 GCM
@@ -129,17 +170,24 @@ pytest -q
    后台线程续办；已归档文件的 DEK 始终能被某个未删除的 KEK 解封，因此**始终可解密**。
 9. **并发模型**：单进程多线程，所有 SQLite 访问与共享状态在一把可重入锁内串行化，
    SQLite 另开 WAL + `busy_timeout` 兜底；密钥文件、blob 均为原子替换写入。
+10. **净化重建（`app/tiff.py`，纯标准库）**：先完整解析并逐页校验全部页面，再一次性重建
+    输出，任一页失败即抛错且不返回部分结果；解析与重建只在内存进行，不引入第三方图像库。
+    净化会话复用下载状态机（accepted → unwrapping → completed/failed），失败也是终态并
+    清空封装材料，因此不残留旧 KEK 引用、不阻塞轮换收尾。
 
-## 七、目录结构
+## 八、目录结构
 
 ```
 app/
 ├── crypto.py          # AES-256-GCM 原语：DEK/KEK 生成、封装/解封、密钥文件原子读写
-├── db.py              # SQLite schema（project_keys/files/uploads/downloads/rotations）
+├── tiff.py            # TIFF 解析/校验与净化重建（纯标准库，明文仅在内存）
+├── db.py              # SQLite schema（含 downloads 表在线迁移）
 ├── service.py         # 状态机、轮换工作线程、暂停门、崩溃恢复（核心）
 ├── main.py            # FastAPI 路由与 lifespan
 └── static/index.html  # 浏览器单页应用
 scripts/demo.sh        # 三类场景的本地演示脚本
-tests/test_archive.py  # 9 个端到端测试
+tests/test_archive.py  # 9 个归档/轮换端到端测试
+tests/test_sanitize.py # 15 个净化下载端到端测试
+tests/tiff_builder.py  # 手工 Classic TIFF 构造/读回辅助
 Dockerfile, docker-compose.yml
 ```
